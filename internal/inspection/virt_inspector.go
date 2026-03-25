@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kubev2v/vm-migration-detective/pkg/startup"
 	"github.com/kubev2v/vm-migration-detective/pkg/types"
 	"github.com/sirupsen/logrus"
 )
@@ -229,6 +230,57 @@ func (i *VirtInspector) Inspect(
 			}).Error("Failed to parse virt-inspector XML output")
 		}
 		return nil, fmt.Errorf("failed to parse inspection output: %w", err)
+	}
+
+	// Add startup service analysis for Linux systems
+	if len(inspectionData.Operatingsystems) > 0 && len(nbdURLs) > 0 {
+		startupAnalyzer := startup.NewStartupAnalyzer(
+			startup.NewLibguestfsWrapper(nbdURLs[0]), // Use first disk for filesystem access
+			i.logger,
+		)
+
+		for idx := range inspectionData.Operatingsystems {
+			os := &inspectionData.Operatingsystems[idx]
+
+			// Only analyze Linux systems
+			if strings.ToLower(os.Distro) == "linux" ||
+				strings.Contains(strings.ToLower(os.Name), "linux") ||
+				strings.Contains(strings.ToLower(os.Distro), "centos") ||
+				strings.Contains(strings.ToLower(os.Distro), "rhel") ||
+				strings.Contains(strings.ToLower(os.Distro), "ubuntu") ||
+				strings.Contains(strings.ToLower(os.Distro), "debian") ||
+				strings.Contains(strings.ToLower(os.Distro), "suse") ||
+				strings.Contains(strings.ToLower(os.Distro), "fedora") {
+
+				i.logger.WithFields(logrus.Fields{
+					"os_name":   os.Name,
+					"os_distro": os.Distro,
+				}).Info("Analyzing startup services for Linux system")
+
+				startupServices, err := startupAnalyzer.AnalyzeStartupServices(ctx)
+				if err != nil {
+					i.logger.WithFields(logrus.Fields{
+						"os_name": os.Name,
+						"error":   err,
+					}).Warn("Failed to analyze startup services - continuing without startup analysis")
+					// Continue without startup analysis - don't fail entire inspection
+				} else {
+					os.StartupServices = *startupServices
+					i.logger.WithFields(logrus.Fields{
+						"os_name":          os.Name,
+						"systemd_services": len(startupServices.SystemdServices),
+						"sysv_services":    len(startupServices.SysVServices),
+						"cron_jobs":        len(startupServices.CronJobs),
+						"boot_scripts":     len(startupServices.BootScripts),
+					}).Info("Startup service analysis completed successfully")
+				}
+			} else {
+				i.logger.WithFields(logrus.Fields{
+					"os_name":   os.Name,
+					"os_distro": os.Distro,
+				}).Debug("Skipping startup service analysis for non-Linux system")
+			}
+		}
 	}
 
 	if UseVirtV2VOpen {
