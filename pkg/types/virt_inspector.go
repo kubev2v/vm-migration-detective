@@ -22,6 +22,7 @@ type VirtInspectorOS struct {
 	Filesystems       VirtInspectorFilesystems  `xml:"filesystems" json:"filesystems,omitempty"`
 	Mountpoints       VirtInspectorMountpoints  `xml:"mountpoints" json:"mountpoints,omitempty"`
 	Drives            VirtInspectorDrives       `xml:"drives" json:"drives,omitempty"`
+	StartupServices   VirtInspectorStartupServices `xml:"startup_services" json:"startup_services,omitempty"`
 }
 
 // VirtInspectorApplications represents the applications section
