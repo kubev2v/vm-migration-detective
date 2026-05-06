@@ -39,14 +39,14 @@ clean:
 	@echo "✅ Clean complete."
 
 ##################### "make lint" support start ##########################
-GOLANGCI_LINT_VERSION := v1.64.8
+GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT := $(GOBIN)/golangci-lint
 
 # Download golangci-lint locally if not already present
 $(GOLANGCI_LINT):
 	@echo "📦 Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."
 	@mkdir -p $(GOBIN)
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | \
+	curl -sSfL https://golangci-lint.run/install.sh | \
 		sh -s -- -b $(GOBIN) $(GOLANGCI_LINT_VERSION)
 	@echo "✅ 'golangci-lint' installed successfully."
 
