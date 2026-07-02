@@ -136,7 +136,9 @@ func (i *VirtV2vInspector) Inspect(
 
 	cmdArgs.Add("--", vmMoref)
 
-	output, err := cmdArgs.RunCombined(inspectCtx, i.virtV2vInspectorPath)
+	// XML goes to stdout; debug messages (-v -x) go to stderr.
+	// Stream stderr in real time so progress is visible during the inspection run.
+	stdoutBytes, stderrBytes, err := cmdArgs.RunSeparateStream(inspectCtx, i.virtV2vInspectorPath, os.Stderr)
 	if inspectCtx.Err() != nil {
 		if inspectCtx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("virt-v2v-inspector command timed out after %v", i.timeout)
@@ -144,14 +146,17 @@ func (i *VirtV2vInspector) Inspect(
 		return nil, fmt.Errorf("virt-v2v-inspector command was cancelled: %w", inspectCtx.Err())
 	}
 
-	outputStr := string(output)
+	stdoutStr := string(stdoutBytes)
+	stderrStr := string(stderrBytes)
+	combinedStr := stdoutStr + stderrStr
 	if err != nil {
 		exitCode := cmdbuilder.ExitCode(err)
 
 		// Check if this is likely an encrypted disk error
-		if encrypted, reason := isEncryptedDiskError(outputStr); encrypted {
+		if encrypted, reason := isEncryptedDiskError(combinedStr); encrypted {
 			i.logger.WithFields(logrus.Fields{
-				"output":          outputStr,
+				"stdout":          stdoutStr,
+				"stderr":          stderrStr,
 				"exit_code":       exitCode,
 				"executable":      i.virtV2vInspectorPath,
 				"args":            cmdArgs.MaskedArgs(),
@@ -169,36 +174,37 @@ func (i *VirtV2vInspector) Inspect(
 		}
 
 		i.logger.WithFields(logrus.Fields{
-			"output":     outputStr,
+			"stdout":     stdoutStr,
+			"stderr":     stderrStr,
 			"exit_code":  exitCode,
 			"executable": i.virtV2vInspectorPath,
 			"args":       cmdArgs.MaskedArgs(),
 		}).Error("virt-v2v-inspector failed")
 
 		// Include output in error message for better debugging
-		if outputStr != "" {
-			return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w\nOutput: %s", exitCode, err, outputStr)
+		if stdoutStr != "" || stderrStr != "" {
+			return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w\nStdout: %s\nStderr: %s", exitCode, err, stdoutStr, stderrStr)
 		}
 		return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w", exitCode, err)
 	}
 
-	// Extract XML from output (virt-v2v-inspector with -v -x may output debug messages)
-	// Look for XML content - it should start with <?xml or <v2v-inspection>
-	xmlStart := strings.Index(outputStr, "<?xml")
+	// Extract XML from stdout (debug messages are on stderr now).
+	// Keep the marker search as a safety net in case any debug lines slip through.
+	xmlStart := strings.Index(stdoutStr, "<?xml")
 	if xmlStart == -1 {
-		xmlStart = strings.Index(outputStr, "<v2v-inspection")
+		xmlStart = strings.Index(stdoutStr, "<v2v-inspection")
 	}
 	if xmlStart == -1 {
-		xmlStart = strings.Index(outputStr, "<operatingsystem")
+		xmlStart = strings.Index(stdoutStr, "<operatingsystem")
 	}
 	if xmlStart == -1 {
-		xmlStart = strings.Index(outputStr, "<inspection")
+		xmlStart = strings.Index(stdoutStr, "<inspection")
 	}
 
 	var xmlData []byte
 	if xmlStart >= 0 {
-		// Extract XML portion from output
-		xmlData = []byte(outputStr[xmlStart:])
+		// Extract XML portion from stdout
+		xmlData = []byte(stdoutStr[xmlStart:])
 		// Find the end of XML (look for closing </v2v-inspection> tag first, then fallback to </operatingsystem>)
 		xmlEnd := strings.LastIndex(string(xmlData), "</v2v-inspection>")
 		if xmlEnd > 0 {
@@ -217,13 +223,13 @@ func (i *VirtV2vInspector) Inspect(
 			if len(xmlPreview) > 1000 {
 				xmlPreview = xmlPreview[:1000] + "... (truncated)"
 			}
-			i.logger.WithField("xml_extracted", xmlPreview).Debug("Extracted XML from output")
+			i.logger.WithField("xml_extracted", xmlPreview).Debug("Extracted XML from stdout")
 		}
 	} else {
-		// No XML found, try parsing the whole output
-		xmlData = output
+		// No XML found, try parsing the whole stdout
+		xmlData = stdoutBytes
 		if i.logger != nil {
-			i.logger.Warn("No XML markers found in output, attempting to parse entire output")
+			i.logger.Warn("No XML markers found in stdout, attempting to parse entire stdout")
 		}
 	}
 
@@ -232,7 +238,8 @@ func (i *VirtV2vInspector) Inspect(
 		if i.logger != nil {
 			i.logger.WithFields(logrus.Fields{
 				"error":  err,
-				"output": outputStr,
+				"stdout": stdoutStr,
+				"stderr": stderrStr,
 			}).Error("Failed to parse virt-v2v-inspector XML output")
 		}
 		return nil, fmt.Errorf("failed to parse virt-v2v-inspector output: %w", err)
