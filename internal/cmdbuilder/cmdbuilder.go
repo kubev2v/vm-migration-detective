@@ -3,6 +3,7 @@ package cmdbuilder
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -192,10 +193,20 @@ func (b *CmdBuilder) Command(ctx context.Context, name string) *exec.Cmd {
 // RunSeparate runs the command and returns stdout and stderr independently.
 // Returns ctx.Err() directly on cancellation or timeout.
 func (b *CmdBuilder) RunSeparate(ctx context.Context, name string) (stdout, stderr []byte, err error) {
+	return b.RunSeparateStream(ctx, name, nil)
+}
+
+// RunSeparateStream runs the command and returns stdout and stderr independently.
+// If stderrStream is non-nil, stderr is also written there in real time (e.g. os.Stderr).
+func (b *CmdBuilder) RunSeparateStream(ctx context.Context, name string, stderrStream io.Writer) (stdout, stderr []byte, err error) {
 	cmd := b.Command(ctx, name)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	if stderrStream != nil {
+		cmd.Stderr = io.MultiWriter(&errBuf, stderrStream)
+	} else {
+		cmd.Stderr = &errBuf
+	}
 	err = cmd.Run()
 	if err != nil && ctx.Err() != nil {
 		return outBuf.Bytes(), errBuf.Bytes(), ctx.Err()

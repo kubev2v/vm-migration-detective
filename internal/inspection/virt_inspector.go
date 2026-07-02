@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -209,8 +210,9 @@ func (i *VirtInspector) attemptInspect(
 		diskArgs.Add(args...)
 	}
 
-	// XML goes to stdout, debug logs to stderr.
-	stdout, stderr, err := diskArgs.RunSeparate(inspectCtx, i.virtInspectorPath)
+	// XML goes to stdout, debug logs to stderr. Stream stderr in real time so
+	// progress is visible during the (potentially long) inspection run.
+	stdout, stderr, err := diskArgs.RunSeparateStream(inspectCtx, i.virtInspectorPath, os.Stderr)
 
 	// Log stderr (debug output) separately
 	if len(stderr) > 0 && i.logger != nil {
