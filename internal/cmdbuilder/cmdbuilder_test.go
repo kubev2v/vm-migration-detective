@@ -188,6 +188,14 @@ var _ = Describe("CmdBuilder", func() {
 			Expect(string(stdout)).To(ContainSubstring("hello"))
 			Expect(stderr).To(BeEmpty())
 		})
+
+		It("returns context.Canceled when context is cancelled", func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, _, err := New().Add("-c", "sleep 10").RunSeparate(ctx, "sh")
+			Expect(err).To(MatchError(context.Canceled))
+		})
 	})
 
 	Describe("RunCombined", func() {
