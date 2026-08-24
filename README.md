@@ -25,9 +25,10 @@ import (
 // Create detector
 detector, err := vmdetect.NewDetector(vmdetect.DetectorConfig{
     Credentials: vmdetect.Credentials{
-        VCenterURL: "https://vcenter.example.com",
-        Username:   "user@vsphere.local",
-        Password:   "password",
+        VCenterURL:    "https://vcenter.example.com",
+        Username:      "user@vsphere.local",
+        Password:      "password",
+        TLSThumbprint: "AA:BB:CC:...", // See TLS Configuration section
     },
     VDDKLibDir: "/opt/vmware-vix-disklib",
     Logger:     logger,  // *logrus.Logger (optional)
@@ -48,6 +49,91 @@ if !result.Passed {
     }
 }
 ```
+
+## TLS Configuration
+
+**⚠️  DEPRECATION NOTICE:** Starting in v1.0.0, TLS configuration will be required. Configure TLS verification now to avoid breaking changes in future releases.
+
+For security, vm-migration-detective supports TLS verification for all vCenter connections. You can configure TLS verification in three ways:
+
+### Option 1: CA Certificate Bundle (Recommended for Production)
+
+Use a CA certificate bundle to verify the vCenter certificate chain:
+
+```go
+detector, err := vmdetect.NewDetector(vmdetect.DetectorConfig{
+    Credentials: vmdetect.Credentials{
+        VCenterURL: "https://vcenter.example.com",
+        Username:   "user@vsphere.local",
+        Password:   "password",
+        TLSCACert:  "/etc/ssl/certs/vcenter-ca.crt",
+    },
+    VDDKLibDir: "/opt/vmware-vix-disklib",
+})
+```
+
+### Option 2: Certificate Thumbprint Pinning
+
+Pin to a specific vCenter certificate using its SHA-1 thumbprint:
+
+```go
+detector, err := vmdetect.NewDetector(vmdetect.DetectorConfig{
+    Credentials: vmdetect.Credentials{
+        VCenterURL:     "https://vcenter.example.com",
+        Username:       "user@vsphere.local",
+        Password:       "password",
+        TLSThumbprint:  "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD",
+    },
+    VDDKLibDir: "/opt/vmware-vix-disklib",
+})
+```
+
+**Getting the vCenter thumbprint:**
+
+```bash
+openssl s_client -connect vcenter.example.com:443 < /dev/null 2>/dev/null | \
+  openssl x509 -fingerprint -sha1 -noout -in /dev/stdin | \
+  cut -d= -f2
+```
+
+### Option 3: Insecure Mode (Testing Only)
+
+**WARNING:** Only use this for testing/development. Your vCenter credentials are vulnerable to MITM attacks.
+
+```go
+detector, err := vmdetect.NewDetector(vmdetect.DetectorConfig{
+    Credentials: vmdetect.Credentials{
+        VCenterURL:  "https://vcenter.example.com",
+        Username:    "user@vsphere.local",
+        Password:    "password",
+        TLSInsecure: true, // Explicitly disable TLS verification
+    },
+    VDDKLibDir: "/opt/vmware-vix-disklib",
+})
+```
+
+### Backward Compatibility (Deprecated)
+
+If no TLS configuration is provided, connections will default to insecure mode with **LOUD deprecation warnings**:
+
+```
+⚠️  ════════════════════════════════════════════════════════════════════════
+⚠️  SECURITY WARNING: TLS verification is DISABLED for vCenter connections!
+⚠️  ════════════════════════════════════════════════════════════════════════
+⚠️  
+⚠️  This configuration is DEPRECATED and will be REQUIRED in v1.0.0
+⚠️  Your vCenter credentials are vulnerable to MITM attacks.
+⚠️  
+⚠️  Please configure TLS verification in Credentials:
+⚠️    • TLSCACert: "/path/to/ca-bundle.crt" (recommended for production)
+⚠️    • TLSThumbprint: "AA:BB:CC:..." (certificate pinning)
+⚠️    • TLSInsecure: true (explicit opt-in for testing only)
+⚠️  
+⚠️  Documentation: https://github.com/kubev2v/vm-migration-detective#tls-configuration
+⚠️  ════════════════════════════════════════════════════════════════════════
+```
+
+This backward-compatible mode will be removed in v1.0.0. **Configure TLS verification now.**
 
 ## API Structure
 
@@ -86,9 +172,10 @@ if !result.Passed {
 ```go
 detector, err := vmdetect.NewDetector(vmdetect.DetectorConfig{
     Credentials: vmdetect.Credentials{
-        VCenterURL: "https://vcenter.example.com",
-        Username:   "admin@vsphere.local",
-        Password:   "password",
+        VCenterURL:    "https://vcenter.example.com",
+        Username:      "admin@vsphere.local",
+        Password:      "password",
+        TLSCACert:     "/etc/ssl/certs/vcenter-ca.crt", // Recommended
     },
     VDDKLibDir: "/opt/vmware-vix-disklib",
 })
