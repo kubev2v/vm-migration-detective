@@ -206,6 +206,7 @@ func (c *Client) FindVMByName(ctx context.Context, datacenter, vmName string) (s
 // SnapshotDiskInfo contains snapshot disk information for inspection
 type SnapshotDiskInfo struct {
 	VMMoref             string
+	VMName              string // VM display name, required as the libvirt domain name for virt-v2v-inspector
 	SnapshotMoref       string
 	ComputeResourcePath string
 }
@@ -220,10 +221,11 @@ func (c *Client) GetSnapshotDiskInfo(ctx context.Context, vmMoref, snapshotMoref
 	}
 	vm := object.NewVirtualMachine(c.client.Client, vmRef)
 
-	// Get VM properties (we only need runtime.host for compute resource path)
+	// Get VM properties: runtime.host for compute resource path, name for the
+	// libvirt domain name virt-v2v-inspector needs (it cannot look up VMs by moref)
 	var vmMo mo.VirtualMachine
 	pc := property.DefaultCollector(c.client.Client)
-	err := pc.RetrieveOne(ctx, vm.Reference(), []string{"runtime.host"}, &vmMo)
+	err := pc.RetrieveOne(ctx, vm.Reference(), []string{"runtime.host", "name"}, &vmMo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get VM properties: %w", err)
 	}
@@ -281,6 +283,7 @@ func (c *Client) GetSnapshotDiskInfo(ctx context.Context, vmMoref, snapshotMoref
 
 	return &SnapshotDiskInfo{
 		VMMoref:             vmMoref,
+		VMName:              vmMo.Name,
 		SnapshotMoref:       snapshotMoref,
 		ComputeResourcePath: computeResourcePath,
 	}, nil
