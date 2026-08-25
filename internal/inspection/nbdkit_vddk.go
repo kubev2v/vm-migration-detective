@@ -16,10 +16,11 @@ import (
 	"github.com/kubev2v/vm-migration-detective/internal/cmdbuilder"
 	"github.com/kubev2v/vm-migration-detective/internal/tlsconfig"
 	"github.com/kubev2v/vm-migration-detective/internal/vddk"
+	"github.com/kubev2v/vm-migration-detective/internal/vsphere"
 	"github.com/sirupsen/logrus"
 )
 
-// NBDKitSession represents an NBD server session created by nbdkit with VDDK plugin
+// NBDKitSession represents an NBD server session created by nbdkit.
 type NBDKitSession struct {
 	NBDURL       string // Unix socket path or NBD URL
 	socketPath   string // Unix socket path (if using Unix socket)
@@ -30,7 +31,8 @@ type NBDKitSession struct {
 	stdoutBuf    *bytes.Buffer
 }
 
-// OpenWithNBDKitVDDK opens a VMware snapshot using nbdkit with VDDK plugin directly
+// OpenWithNBDKitVDDK opens a VMware snapshot using nbdkit with the available transport.
+// VDDK is preferred when installed; NFC is used when VDDK is unavailable.
 // Parameters:
 //   - vmMoref: VM managed object reference (e.g., "vm-123")
 //   - snapshotMoref: Snapshot managed object reference (e.g., "snapshot-456")
@@ -48,6 +50,25 @@ func OpenWithNBDKitVDDK(
 	username string,
 	password string,
 	tlsConfig *tlsconfig.Config,
+	logger *logrus.Logger,
+) (*NBDKitSession, error) {
+	return openWithNBDKit(ctx, vmMoref, snapshotMoref, baseDiskPath, vcenterURL, username, password, tlsConfig, nil, logger)
+}
+
+type snapshotDiskPathResolver interface {
+	GetSnapshotDiskFilePath(ctx context.Context, snapshotMoref, baseDiskPath string) (string, error)
+}
+
+func openWithNBDKit(
+	ctx context.Context,
+	vmMoref string,
+	snapshotMoref string,
+	baseDiskPath string,
+	vcenterURL string,
+	username string,
+	password string,
+	tlsConfig *tlsconfig.Config,
+	pathResolver snapshotDiskPathResolver,
 	logger *logrus.Logger,
 ) (*NBDKitSession, error) {
 	// Parse vCenter URL to extract hostname
@@ -87,12 +108,6 @@ func OpenWithNBDKitVDDK(
 	// Create temporary Unix socket for nbdkit (more reliable than TCP port)
 	socketPath := filepath.Join("/tmp", fmt.Sprintf("nbdkit-%s.sock", uuid.New().String()))
 
-	// Create temporary password file for secure password passing
-	passwordFile, err := createNBDKitPasswordFile(password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create password file: %w", err)
-	}
-
 	vddkLibDir := vddk.GetLibDir()
 	nbdkitPlugin := "vddk"
 	if info, err := os.Stat(vddkLibDir); err != nil || !info.IsDir() {
@@ -102,6 +117,28 @@ func OpenWithNBDKitVDDK(
 		} else if _, err := os.Stat(nbdkitPlugin); err != nil {
 			return nil, fmt.Errorf("VDDK library directory or nbdkit-nfc plugin not found")
 		}
+	}
+
+	diskFile := baseDiskPath
+	if nbdkitPlugin != "vddk" {
+		if pathResolver == nil {
+			vsphereClient, err := vsphere.NewClient(ctx, vcenterURL, username, password, tlsConfig, logger)
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to vSphere to resolve snapshot disk path: %w", err)
+			}
+			defer vsphereClient.Close()
+			pathResolver = vsphereClient
+		}
+		diskFile, err = pathResolver.GetSnapshotDiskFilePath(ctx, snapshotMoref, baseDiskPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve NFC snapshot disk path: %w", err)
+		}
+	}
+
+	// Create temporary password file only after backend-specific path resolution succeeds.
+	passwordFile, err := createNBDKitPasswordFile(password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create password file: %w", err)
 	}
 
 	nbdkitCmd := cmdbuilder.New().
@@ -116,7 +153,7 @@ func OpenWithNBDKitVDDK(
 		SensitiveArg(fmt.Sprintf("password=+%s", passwordFile), "password=+***").
 		Add(fmt.Sprintf("vm=moref=%s", vmMoref)).
 		Add(fmt.Sprintf("snapshot=%s", snapshotMoref)).
-		Add(fmt.Sprintf("file=%s", baseDiskPath)).
+		Add(fmt.Sprintf("file=%s", diskFile)).
 		AddIf(nbdkitPlugin == "vddk", fmt.Sprintf("libdir=%s", vddkLibDir)).
 		AddIf(thumbprint != "", fmt.Sprintf("thumbprint=%s", thumbprint))
 
@@ -125,7 +162,8 @@ func OpenWithNBDKitVDDK(
 			"socket_path":    socketPath,
 			"vm_moref":       vmMoref,
 			"snapshot_moref": snapshotMoref,
-			"disk_path":      baseDiskPath,
+			"base_disk_path": baseDiskPath,
+			"disk_path":      diskFile,
 			"plugin":         nbdkitPlugin,
 		}).Info("Starting nbdkit")
 	}

@@ -1,11 +1,15 @@
 package cmdbuilder
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -212,6 +216,119 @@ func (b *CmdBuilder) RunCombined(ctx context.Context, name string) ([]byte, erro
 		return output, ctx.Err()
 	}
 	return output, err
+}
+
+// RunStreamed runs the command and returns merged stdout+stderr, like RunCombined,
+// but also invokes onLine (if non-nil) with each line as it is produced, so a
+// caller can surface live progress on a long-running command instead of only
+// seeing output after it exits. Returns ctx.Err() directly on cancellation or timeout.
+func (b *CmdBuilder) RunStreamed(ctx context.Context, name string, onLine func(line string)) ([]byte, error) {
+	cmd := b.Command(ctx, name)
+	cmd.WaitDelay = time.Second
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	var scanErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = pr.Close() }()
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			mu.Lock()
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+			mu.Unlock()
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+		scanErr = scanner.Err()
+	}()
+
+	err := cmd.Start()
+	if err != nil {
+		_ = pw.Close()
+		<-done
+		return nil, err
+	}
+	if b.logger != nil {
+		b.logger.WithField("pid", cmd.Process.Pid).Info("Process started")
+	}
+
+	err = cmd.Wait()
+	_ = pw.Close()
+	<-done
+
+	if err != nil && ctx.Err() != nil {
+		return buf.Bytes(), ctx.Err()
+	}
+	if err == nil && scanErr != nil {
+		return buf.Bytes(), scanErr
+	}
+	return buf.Bytes(), err
+}
+
+// RunStreamedSeparate runs the command and returns stdout and stderr
+// independently, while streaming stderr lines through onLine for live progress.
+// Stdout is captured into a buffer (no streaming — suitable for structured
+// output like XML). Returns ctx.Err() directly on cancellation or timeout.
+func (b *CmdBuilder) RunStreamedSeparate(ctx context.Context, name string, onLine func(line string)) (stdout, stderr []byte, err error) {
+	cmd := b.Command(ctx, name)
+	cmd.WaitDelay = 5 * time.Second
+
+	var stdoutBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+
+	stderrPr, stderrPw := io.Pipe()
+	cmd.Stderr = stderrPw
+
+	var stderrBuf bytes.Buffer
+	var scanErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = stderrPr.Close() }()
+		scanner := bufio.NewScanner(stderrPr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			stderrBuf.WriteString(line)
+			stderrBuf.WriteByte('\n')
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+		scanErr = scanner.Err()
+	}()
+
+	err = cmd.Start()
+	if err != nil {
+		_ = stderrPw.Close()
+		<-done
+		return nil, nil, err
+	}
+	if b.logger != nil {
+		b.logger.WithField("pid", cmd.Process.Pid).Info("Process started")
+	}
+
+	err = cmd.Wait()
+	_ = stderrPw.Close()
+	<-done
+
+	if err != nil && ctx.Err() != nil {
+		return stdoutBuf.Bytes(), stderrBuf.Bytes(), ctx.Err()
+	}
+	if err == nil && scanErr != nil {
+		return stdoutBuf.Bytes(), stderrBuf.Bytes(), scanErr
+	}
+	return stdoutBuf.Bytes(), stderrBuf.Bytes(), err
 }
 
 // ExitCode extracts the exit code from a run error; returns -1 if not available.
