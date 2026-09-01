@@ -3,9 +3,8 @@ package inspection
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/sha1"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -358,20 +357,13 @@ func getVCenterThumbprint(vcenterHost string) (string, error) {
 	// Use the first certificate (server certificate)
 	cert := certs[0]
 
-	// Calculate SHA-256 thumbprint
-	thumbprint := sha256.Sum256(cert.Raw)
-
-	// Format as colon-separated hex string (VMware format)
-	hexThumbprint := hex.EncodeToString(thumbprint[:])
-	formatted := ""
-	for i := 0; i < len(hexThumbprint); i += 2 {
-		if i > 0 {
-			formatted += ":"
-		}
-		formatted += hexThumbprint[i : i+2]
+	// VMware/govmomi compare SHA-1 thumbprints case-sensitively as AA:BB:...
+	sum := sha1.Sum(cert.Raw)
+	parts := make([]string, len(sum))
+	for i, b := range sum {
+		parts[i] = fmt.Sprintf("%02X", b)
 	}
-
-	return formatted, nil
+	return strings.Join(parts, ":"), nil
 }
 
 // createNBDKitPasswordFile creates a temporary file with the password for nbdkit
