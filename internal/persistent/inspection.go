@@ -2,11 +2,13 @@ package persistent
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/kubev2v/vm-migration-detective/internal/inspection"
 	"github.com/kubev2v/vm-migration-detective/internal/vddk"
+	"github.com/kubev2v/vm-migration-detective/internal/vsphere"
 	"github.com/kubev2v/vm-migration-detective/pkg/types"
 	"github.com/sirupsen/logrus"
 )
@@ -26,6 +28,12 @@ type InspectorInterface interface {
 
 	// GetDB returns the database instance used by the inspector
 	GetDB() DB
+
+	// ExtractFileFromGuest extracts a file from the guest VM filesystem.
+	// Uses NBD + guestfish copy-out to access VM disk and extract files.
+	// rootDevice is the guest device from virt-inspector (e.g., "/dev/sda2")
+	// used to select the correct disk and mount point.
+	ExtractFileFromGuest(ctx context.Context, vmMoref string, snapshotMoref string, diskInfo *types.SnapshotDiskInfo, guestPath string, destDir string, rootDevice string) error
 }
 
 // Inspector wraps both VirtInspector and VirtV2vInspector with memory and DB persistence
@@ -378,4 +386,118 @@ func (t *inflightTracker[T]) do(key CacheKey, fn func() (T, error)) (T, error, b
 // GetDB returns the database instance used by the inspector
 func (p *Inspector) GetDB() DB {
 	return p.db
+}
+
+// ExtractFileFromGuest extracts a file from the guest VM filesystem.
+// Uses NBD session + guestfish copy-out with explicit mount point.
+// rootDevice (e.g., "/dev/sda2") identifies which disk to open and which
+// partition to mount. Obtained from virt-inspector's OS Root field.
+func (p *Inspector) ExtractFileFromGuest(
+	ctx context.Context,
+	vmMoref string,
+	snapshotMoref string,
+	diskInfo *types.SnapshotDiskInfo,
+	guestPath string,
+	destDir string,
+	rootDevice string,
+) error {
+	if p.logger != nil {
+		p.logger.WithFields(logrus.Fields{
+			"vm_moref":       vmMoref,
+			"snapshot_moref": snapshotMoref,
+			"guest_path":     guestPath,
+			"dest_dir":       destDir,
+			"root_device":    rootDevice,
+		}).Info("Extracting file from guest VM")
+	}
+
+	vsphereClient, err := vsphere.NewClient(ctx, p.credentials.VCenterURL, p.credentials.Username, p.credentials.Password, true, p.logger)
+	if err != nil {
+		return fmt.Errorf("failed to connect to vSphere: %w", err)
+	}
+	defer vsphereClient.Close()
+
+	baseDiskPaths, err := vsphereClient.GetBaseDiskPaths(ctx, vmMoref)
+	if err != nil {
+		return fmt.Errorf("failed to query base disk paths: %w", err)
+	}
+
+	if len(baseDiskPaths) == 0 {
+		return fmt.Errorf("no disks found for VM %s", vmMoref)
+	}
+
+	diskIndex := inspection.DiskDeviceToIndex(rootDevice)
+	if diskIndex >= len(baseDiskPaths) {
+		if p.logger != nil {
+			p.logger.WithFields(logrus.Fields{
+				"root_device":     rootDevice,
+				"disk_index":      diskIndex,
+				"available_disks": len(baseDiskPaths),
+			}).Warn("Root device maps to disk index beyond available disks, falling back to first disk")
+		}
+		diskIndex = 0
+	}
+	baseDiskPath := baseDiskPaths[diskIndex]
+
+	if p.logger != nil {
+		p.logger.WithFields(logrus.Fields{
+			"root_device":    rootDevice,
+			"disk_index":     diskIndex,
+			"base_disk_path": baseDiskPath,
+		}).Info("Selected disk for file extraction")
+	}
+
+	nbdSession, err := inspection.OpenWithNBDKitVDDK(
+		ctx,
+		vmMoref,
+		snapshotMoref,
+		baseDiskPath,
+		p.credentials.VCenterURL,
+		p.credentials.Username,
+		p.credentials.Password,
+		p.logger,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create NBD session: %w", err)
+	}
+	defer nbdSession.Close()
+
+	if err := nbdSession.WaitForReady(30 * time.Second); err != nil {
+		return fmt.Errorf("NBD server not ready: %w", err)
+	}
+
+	const maxFileSizeMB = 100
+	maxFileSizeBytes := int64(maxFileSizeMB * 1024 * 1024)
+
+	copyCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	// rootDevice is the full partition device (e.g., "/dev/sda2").
+	// Since we opened only one disk via NBD, guestfish sees it as /dev/sda,
+	// so we remap to /dev/sda + original partition number.
+	mountDevice := remapDeviceForSingleDisk(rootDevice)
+
+	_, err = inspection.CopyFileWithSizeCheck(copyCtx, nbdSession.NBDURL, mountDevice, guestPath, destDir, maxFileSizeBytes, p.logger)
+	if err != nil {
+		return fmt.Errorf("failed to extract file: %w", err)
+	}
+
+	return nil
+}
+
+// remapDeviceForSingleDisk converts a multi-disk device path to single-disk equivalent.
+// When we open only one disk via NBD, guestfish sees it as /dev/sda regardless of its
+// original position. So /dev/sdb2 becomes /dev/sda2, /dev/sdc1 becomes /dev/sda1, etc.
+func remapDeviceForSingleDisk(rootDevice string) string {
+	if rootDevice == "" {
+		return "/dev/sda1"
+	}
+	_, partition, ok := inspection.ParseDeviceParts(rootDevice)
+	if !ok {
+		return rootDevice
+	}
+	if partition == "" {
+		return "/dev/sda"
+	}
+	return "/dev/sda" + partition
 }
