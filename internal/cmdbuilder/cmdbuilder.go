@@ -198,12 +198,14 @@ func (b *CmdBuilder) RunSeparate(ctx context.Context, name string) (stdout, stde
 
 // RunSeparateStream runs the command and returns stdout and stderr independently.
 // If stderrStream is non-nil, stderr is also written there in real time (e.g. os.Stderr).
+// Write errors from stderrStream are silently ignored so that a broken stream
+// consumer never masks the command's own exit status.
 func (b *CmdBuilder) RunSeparateStream(ctx context.Context, name string, stderrStream io.Writer) (stdout, stderr []byte, err error) {
 	cmd := b.Command(ctx, name)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	if stderrStream != nil {
-		cmd.Stderr = io.MultiWriter(&errBuf, stderrStream)
+		cmd.Stderr = io.MultiWriter(&errBuf, &errIgnoreWriter{w: stderrStream})
 	} else {
 		cmd.Stderr = &errBuf
 	}
@@ -212,6 +214,16 @@ func (b *CmdBuilder) RunSeparateStream(ctx context.Context, name string, stderrS
 		return outBuf.Bytes(), errBuf.Bytes(), ctx.Err()
 	}
 	return outBuf.Bytes(), errBuf.Bytes(), err
+}
+
+// errIgnoreWriter wraps a writer and discards any error it returns, so that
+// write failures on the stream side do not propagate to the caller.
+type errIgnoreWriter struct{ w io.Writer }
+
+func (e *errIgnoreWriter) Write(p []byte) (int, error) {
+	//nolint:errcheck
+	_, _ = e.w.Write(p)
+	return len(p), nil
 }
 
 // RunCombined runs the command and returns merged stdout+stderr.

@@ -188,6 +188,8 @@ func (r *Detector) Detect(params DetectParams, checkTypes ...checks.CheckType) (
 			check = internalchecks.NewFstabCheck()
 		case checks.CheckTypeDiskAccess:
 			check = internalchecks.NewDiskAccessCheck()
+		case checks.CheckTypeVirtV2VInspector:
+			check = internalchecks.NewVirtV2VInspectorCheck()
 		default:
 			// Unknown check type, skip
 			continue

@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/kubev2v/vm-migration-detective/internal/cmdbuilder"
-	"github.com/kubev2v/vm-migration-detective/internal/vddk"
 	"github.com/kubev2v/vm-migration-detective/pkg/types"
 	"github.com/sirupsen/logrus"
 )
@@ -37,7 +35,9 @@ func NewVirtV2vInspector(virtV2vInspectorPath string, timeout time.Duration, log
 	}
 }
 
-// Inspect uses virt-v2v-inspector to inspect a VM snapshot directly via VDDK
+// Inspect uses virt-v2v-inspector to inspect a VM snapshot via nbdkit-vddk,
+// mirroring the approach used by VirtInspector.
+// It retries once on cold-start VDDK failures (same known bug as VirtInspector).
 func (i *VirtV2vInspector) Inspect(
 	ctx context.Context,
 	vmMoref string,
@@ -45,34 +45,41 @@ func (i *VirtV2vInspector) Inspect(
 	vcenterURL string,
 	username string,
 	password string,
-	diskInfo *types.SnapshotDiskInfo, // Snapshot disk info from vm_service
-	sslVerify string, // SSL verification option for vpx:// URL (e.g., "no_verify=1" or "cacert=/path/to/ca-bundle.crt")
+	diskInfo *types.SnapshotDiskInfo,
+) (*types.VirtV2VInspectorXML, error) {
+	result, err := i.attemptInspect(ctx, vmMoref, snapshotMoref, vcenterURL, username, password, diskInfo)
+	if err != nil && strings.Contains(err.Error(), "cold-start") {
+		if i.logger != nil {
+			i.logger.WithError(err).Warn("virt-v2v-inspector failed with cold-start symptoms, retrying once")
+		}
+		time.Sleep(2 * time.Second)
+		result, err = i.attemptInspect(ctx, vmMoref, snapshotMoref, vcenterURL, username, password, diskInfo)
+		if err == nil && i.logger != nil {
+			i.logger.Info("virt-v2v-inspector succeeded on retry (VDDK cold-start issue worked around)")
+		}
+	}
+	return result, err
+}
+
+func (i *VirtV2vInspector) attemptInspect(
+	ctx context.Context,
+	vmMoref string,
+	snapshotMoref string,
+	vcenterURL string,
+	username string,
+	password string,
+	diskInfo *types.SnapshotDiskInfo,
 ) (*types.VirtV2VInspectorXML, error) {
 	i.logger.WithFields(logrus.Fields{
 		"vm_moref":       vmMoref,
 		"snapshot_moref": snapshotMoref,
 		"vcenter_url":    vcenterURL,
-	}).Info("Running virt-v2v-inspector on snapshot")
+	}).Info("Running virt-v2v-inspector using nbdkit-vddk (VDDK + snapshot)")
 
-	// Build libvirt connection URL for vSphere
-	// Format: vpx://username@vcenter/compute-resource-path?ssl-verify
-	// The path must point to a compute resource (host/cluster), not the datacenter or VM
-	// The VM name is specified as a positional argument after "--"
-	// Username is in URL (needed by virt-v2v-inspector to pass to VDDK)
-	// Password is provided via -ip file (secure)
-	// Extract hostname from vCenter URL
-	vcenterHost := extractHostname(vcenterURL)
-
-	// URL-encode username to handle special characters like @
-	// The @ symbol in the username needs to be percent-encoded as %40
-	// because @ is used as a delimiter between username and hostname in URLs
-	encodedUsername := url.QueryEscape(username)
-
-	// Use the compute resource path from diskInfo (e.g., "/Datacenter/Cluster/host.example.com")
-	// This is required for vpx:// URLs - they need a compute resource, not just a datacenter
-	computeResourcePath := diskInfo.ComputeResourcePath
-	if computeResourcePath == "" {
-		return nil, fmt.Errorf("compute resource path is required for vpx:// URL")
+	// Query vSphere to get base disk paths by traversing the backing chain
+	baseDiskPaths, err := getBaseDiskPathsFromVSphere(ctx, vcenterURL, username, password, diskInfo.VMMoref, i.logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query base disk paths from vSphere: %w", err)
 	}
 
 	// Build vpx:// URL with username
@@ -81,40 +88,70 @@ func (i *VirtV2vInspector) Inspect(
 	// Add SSL verification parameter (provided by caller)
 	libvirtURL := fmt.Sprintf("vpx://%s@%s%s?%s",
 		encodedUsername, bracketIPv6(vcenterHost), computeResourcePath, sslVerify)
+	i.logger.WithFields(logrus.Fields{
+		"disk_count":      len(baseDiskPaths),
+		"base_disk_paths": baseDiskPaths,
+	}).Info("Queried base disk paths from vSphere")
 
-	// Create context with timeout
-	inspectCtx, cancel := context.WithTimeout(ctx, i.timeout)
+	openCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	// Create a password file for VDDK authentication
-	// VDDK uses -io vddk-password=+file to read password securely
-	passwordFile, err := i.createPasswordFile(password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create password file: %w", err)
-	}
-	defer func() { _ = os.Remove(passwordFile) }()
+	// Start one nbdkit session per disk
+	var nbdkitSessions []*NBDKitSession
+	var nbdURLs []string
 
-	// Strip VDDK paths from LD_LIBRARY_PATH so libguestfs/supermin doesn't pick them up.
-	thumbprint, err := getVCenterThumbprint(vcenterHost)
-	if err != nil {
-		i.logger.WithError(err).Warn("Failed to get thumbprint, proceeding without SSL verification")
+	for idx, baseDiskPath := range baseDiskPaths {
+		i.logger.WithFields(logrus.Fields{
+			"disk_index":     idx,
+			"base_disk_path": baseDiskPath,
+		}).Debug("Starting NBDkit session for disk")
+
+		session, err := OpenWithNBDKitVDDK(
+			openCtx,
+			diskInfo.VMMoref,
+			diskInfo.SnapshotMoref,
+			baseDiskPath,
+			vcenterURL,
+			username,
+			password,
+			i.logger,
+		)
+		if err != nil {
+			for _, s := range nbdkitSessions {
+				s.Close()
+			}
+			return nil, fmt.Errorf("failed to start NBDkit session for disk %d: %w", idx, err)
+		}
+		nbdkitSessions = append(nbdkitSessions, session)
+		nbdURLs = append(nbdURLs, session.NBDURL)
+
+		if err := session.WaitForReady(30 * time.Second); err != nil {
+			i.logger.WithError(err).WithField("disk_index", idx).Error("NBD server not ready")
+			for _, s := range nbdkitSessions {
+				s.Close()
+			}
+			return nil, fmt.Errorf("NBD server not ready for disk %d: %w", idx, err)
+		}
 	}
-	vddkLibDir := vddk.GetLibDir()
-	vddkLibPath := vddk.GetLibPath()
+	defer func() {
+		for _, s := range nbdkitSessions {
+			s.Close()
+		}
+	}()
+
+	inspectCtx, cancel2 := context.WithTimeout(ctx, i.timeout)
+	defer cancel2()
+
+	i.logger.WithFields(logrus.Fields{
+		"nbd_urls":   nbdURLs,
+		"disk_count": len(nbdURLs),
+	}).Info("Running virt-v2v-inspector on NBD")
 
 	diskUnlock := resolveDiskUnlock(i.logger)
 
 	cmdArgs := cmdbuilder.New().
 		WithLogger(i.logger).
-		FilterEnv("LD_LIBRARY_PATH", func(val string) string {
-			var kept []string
-			for _, p := range strings.Split(val, ":") {
-				if p != vddkLibPath && !strings.Contains(p, "vmware-vix-disklib") {
-					kept = append(kept, p)
-				}
-			}
-			return strings.Join(kept, ":")
-		}).
+		UnsetEnv("LD_LIBRARY_PATH").
 		SetEnv("LIBGUESTFS_DEBUG", "1").
 		Add("-v", "-x").
 		Flag("-i", "libvirt").
@@ -134,12 +171,18 @@ func (i *VirtV2vInspector) Inspect(
 			cmdArgs.Flag("-io", fmt.Sprintf("%s-file=%s", nbdkitPlugin, baseDiskPath))
 		}
 	}
+	cmdArgs.Flag("-i", "disk").
+		Flag("-if", "raw")
 
 	if args := diskUnlock.Args(); len(args) > 0 {
 		cmdArgs.Add(args...)
 	}
 
-	cmdArgs.Add("--", vmMoref)
+	// Disk images are positional arguments when using -i disk
+	cmdArgs.Add("--")
+	for _, url := range nbdURLs {
+		cmdArgs.Add(url)
+	}
 
 	// XML goes to stdout; debug messages (-v -x) go to stderr.
 	// Stream stderr in real time so progress is visible during the inspection run.
@@ -152,16 +195,15 @@ func (i *VirtV2vInspector) Inspect(
 	}
 
 	stdoutStr := string(stdoutBytes)
-	stderrStr := string(stderrBytes)
-	combinedStr := stdoutStr + stderrStr
+	// stderrBytes is kept only for encrypted-disk pattern detection; the content
+	// was already streamed live to os.Stderr so we do not log it again.
+	combinedStr := stdoutStr + string(stderrBytes)
 	if err != nil {
 		exitCode := cmdbuilder.ExitCode(err)
 
 		// Check if this is likely an encrypted disk error
 		if encrypted, reason := isEncryptedDiskError(combinedStr); encrypted {
 			i.logger.WithFields(logrus.Fields{
-				"stdout":          stdoutStr,
-				"stderr":          stderrStr,
 				"exit_code":       exitCode,
 				"executable":      i.virtV2vInspectorPath,
 				"args":            cmdArgs.MaskedArgs(),
@@ -178,17 +220,25 @@ func (i *VirtV2vInspector) Inspect(
 			}
 		}
 
+		// Detect cold-start VDDK failure from stderr (content was already streamed
+		// live to os.Stderr, so we only embed a short sentinel — not the full output).
+		if isColdStartOutput(string(stderrBytes)) {
+			i.logger.WithFields(logrus.Fields{
+				"exit_code":  exitCode,
+				"executable": i.virtV2vInspectorPath,
+				"args":       cmdArgs.MaskedArgs(),
+			}).Error("virt-v2v-inspector failed with cold-start symptoms")
+			return nil, fmt.Errorf("virt-v2v-inspector cold-start failure (exit code %d): %w", exitCode, err)
+		}
+
 		i.logger.WithFields(logrus.Fields{
-			"stdout":     stdoutStr,
-			"stderr":     stderrStr,
 			"exit_code":  exitCode,
 			"executable": i.virtV2vInspectorPath,
 			"args":       cmdArgs.MaskedArgs(),
 		}).Error("virt-v2v-inspector failed")
 
-		// Include output in error message for better debugging
-		if stdoutStr != "" || stderrStr != "" {
-			return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w\nStdout: %s\nStderr: %s", exitCode, err, stdoutStr, stderrStr)
+		if stdoutStr != "" {
+			return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w\nStdout: %s", exitCode, err, stdoutStr)
 		}
 		return nil, fmt.Errorf("virt-v2v-inspector failed (exit code %d): %w", exitCode, err)
 	}
@@ -208,15 +258,12 @@ func (i *VirtV2vInspector) Inspect(
 
 	var xmlData []byte
 	if xmlStart >= 0 {
-		// Extract XML portion from stdout
 		xmlData = []byte(stdoutStr[xmlStart:])
-		// Find the end of XML (look for closing </v2v-inspection> tag first, then fallback to </operatingsystem>)
 		xmlEnd := strings.LastIndex(string(xmlData), "</v2v-inspection>")
 		if xmlEnd > 0 {
 			xmlEnd += len("</v2v-inspection>")
 			xmlData = xmlData[:xmlEnd]
 		} else {
-			// Fallback: look for </operatingsystem> if </v2v-inspection> not found
 			xmlEnd = strings.LastIndex(string(xmlData), "</operatingsystem>")
 			if xmlEnd > 0 {
 				xmlEnd += len("</operatingsystem>")
@@ -231,7 +278,6 @@ func (i *VirtV2vInspector) Inspect(
 			i.logger.WithField("xml_extracted", xmlPreview).Debug("Extracted XML from stdout")
 		}
 	} else {
-		// No XML found, try parsing the whole stdout
 		xmlData = stdoutBytes
 		if i.logger != nil {
 			i.logger.Warn("No XML markers found in stdout, attempting to parse entire stdout")
@@ -244,7 +290,6 @@ func (i *VirtV2vInspector) Inspect(
 			i.logger.WithFields(logrus.Fields{
 				"error":  err,
 				"stdout": stdoutStr,
-				"stderr": stderrStr,
 			}).Error("Failed to parse virt-v2v-inspector XML output")
 		}
 		return nil, fmt.Errorf("failed to parse virt-v2v-inspector output: %w", err)
@@ -252,52 +297,6 @@ func (i *VirtV2vInspector) Inspect(
 
 	i.logger.Info("virt-v2v-inspector snapshot inspection completed successfully")
 	return inspectionData, nil
-}
-
-// extractHostname extracts hostname from a URL
-func extractHostname(urlStr string) string {
-	if urlStr == "" {
-		return ""
-	}
-
-	// Try parsing as URL
-	parsedURL, err := url.Parse(urlStr)
-	if err == nil && parsedURL.Hostname() != "" {
-		return parsedURL.Hostname()
-	}
-
-	// If parsing fails, assume it's already a hostname
-	return urlStr
-}
-
-// createPasswordFile creates a temporary file with the password
-// virt-v2v-inspector expects -ip to be a file path, not the password directly
-func (i *VirtV2vInspector) createPasswordFile(password string) (string, error) {
-	tmpFile, err := os.CreateTemp("", "v2v-password-*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary password file: %w", err)
-	}
-
-	// Write password to file
-	if _, err := tmpFile.WriteString(password); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to write password to file: %w", err)
-	}
-
-	// Close the file
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to close password file: %w", err)
-	}
-
-	// Set restrictive permissions (read-only for owner)
-	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
-		_ = os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to set password file permissions: %w", err)
-	}
-
-	return tmpFile.Name(), nil
 }
 
 // parseV2VInspectionXML parses virt-v2v-inspector XML output and returns the native XML structure

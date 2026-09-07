@@ -36,13 +36,20 @@ const (
 	CheckTypeFstab CheckType = "fstab"
 	// CheckTypeDiskAccess validates that the disk is accessible (not encrypted)
 	CheckTypeDiskAccess CheckType = "disk-access"
+	// CheckTypeVirtV2VInspector runs virt-v2v-inspector and reports a Critical
+	// concern if the tool exits with a non-zero return code.
+	// This check always runs after the virt-inspector-based checks.
+	CheckTypeVirtV2VInspector CheckType = "virt-v2v-inspector"
 )
 
-// AllCheckTypes returns all available check types
+// AllCheckTypes returns all available check types in run order.
+// virt-v2v-inspector is intentionally last so it runs after the
+// virt-inspector-based checks (fstab, disk-access).
 func AllCheckTypes() []CheckType {
 	return []CheckType{
 		CheckTypeFstab,
 		CheckTypeDiskAccess,
+		CheckTypeVirtV2VInspector,
 	}
 }
 
