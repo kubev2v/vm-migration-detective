@@ -22,7 +22,7 @@ type InspectorInterface interface {
 	InspectWithVirt(ctx context.Context, vmMoref string, snapshotMoref string, diskInfo *types.SnapshotDiskInfo) (*types.VirtInspectorXML, error)
 
 	// InspectWithVirtV2v performs inspection using VirtV2vInspector with memory and DB caching
-	InspectWithVirtV2v(ctx context.Context, vmMoref string, snapshotMoref string, diskInfo *types.SnapshotDiskInfo, sslVerify string) (*types.VirtV2VInspectorXML, error)
+	InspectWithVirtV2v(ctx context.Context, vmMoref string, snapshotMoref string, diskInfo *types.SnapshotDiskInfo) (*types.VirtV2VInspectorXML, error)
 
 	// GetDB returns the database instance used by the inspector
 	GetDB() DB
@@ -171,7 +171,6 @@ func (p *Inspector) InspectWithVirtV2v(
 	vmMoref string,
 	snapshotMoref string,
 	diskInfo *types.SnapshotDiskInfo,
-	sslVerify string,
 ) (*types.VirtV2VInspectorXML, error) {
 	key := CacheKey{
 		VMMoref:       vmMoref,
@@ -231,7 +230,7 @@ func (p *Inspector) InspectWithVirtV2v(
 			}).Info("Performing new inspection (not found in cache)")
 		}
 
-		result, err := p.virtV2vInspector.Inspect(ctx, vmMoref, snapshotMoref, p.credentials.VCenterURL, p.credentials.Username, p.credentials.Password, diskInfo, sslVerify)
+		result, err := p.virtV2vInspector.Inspect(ctx, vmMoref, snapshotMoref, p.credentials.VCenterURL, p.credentials.Username, p.credentials.Password, diskInfo)
 		if err != nil {
 			return nil, err
 		}

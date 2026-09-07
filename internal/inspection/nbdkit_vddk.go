@@ -337,6 +337,15 @@ func bracketIPv6(host string) string {
 	return host
 }
 
+// isColdStartOutput reports whether output contains the well-known VDDK cold-start
+// error patterns.  VDDK has a known bug where it crashes on the first connection
+// after container start (https://issues.redhat.com/browse/RHEL-54377).
+func isColdStartOutput(output string) bool {
+	return strings.Contains(output, "Connection refused") ||
+		strings.Contains(output, "Unexpected end-of-file") ||
+		strings.Contains(output, "Failed to read option reply")
+}
+
 // getVCenterThumbprint gets the SSL certificate thumbprint from vCenter
 func getVCenterThumbprint(vcenterHost string) (string, error) {
 	// net.JoinHostPort wraps IPv6 addresses in brackets automatically
@@ -388,7 +397,7 @@ func createNBDKitPasswordFile(password string) (string, error) {
 	}
 
 	// Set restrictive permissions (read-only for owner)
-	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+	if err := os.Chmod(tmpFile.Name(), 0o600); err != nil {
 		_ = os.Remove(tmpFile.Name())
 		return "", fmt.Errorf("failed to set password file permissions: %w", err)
 	}

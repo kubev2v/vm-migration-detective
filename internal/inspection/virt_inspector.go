@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -53,22 +54,14 @@ func (i *VirtInspector) Inspect(
 	// VDDK has a known bug where it crashes on first connection after container start
 	// See: https://issues.redhat.com/browse/RHEL-54377
 	result, err := i.attemptInspect(ctx, vmMoref, snapshotMoref, vcenterURL, username, password, diskInfo)
-	if err != nil {
-		// Check if this looks like a cold-start failure (connection refused, EOF, etc.)
-		errStr := err.Error()
-		isColdStartFailure := strings.Contains(errStr, "Connection refused") ||
-			strings.Contains(errStr, "Unexpected end-of-file") ||
-			strings.Contains(errStr, "Failed to read option reply")
-
-		if isColdStartFailure && i.logger != nil {
+	if err != nil && strings.Contains(err.Error(), "cold-start") {
+		if i.logger != nil {
 			i.logger.WithError(err).Warn("Inspection failed with cold-start symptoms, retrying once")
-			// Wait a moment for the system to stabilize
-			time.Sleep(2 * time.Second)
-			// Retry - VDDK should be warm now
-			result, err = i.attemptInspect(ctx, vmMoref, snapshotMoref, vcenterURL, username, password, diskInfo)
-			if err == nil && i.logger != nil {
-				i.logger.Info("Inspection succeeded on retry (VDDK cold-start issue worked around)")
-			}
+		}
+		time.Sleep(2 * time.Second)
+		result, err = i.attemptInspect(ctx, vmMoref, snapshotMoref, vcenterURL, username, password, diskInfo)
+		if err == nil && i.logger != nil {
+			i.logger.Info("Inspection succeeded on retry (VDDK cold-start issue worked around)")
 		}
 	}
 	return result, err
@@ -126,7 +119,7 @@ func (i *VirtInspector) attemptInspect(
 		}).Debug("Using VM and snapshot morefs from caller")
 
 		// Query vSphere to get base disk paths by traversing backing chain
-		baseDiskPaths, err := i.getBaseDiskPathsFromVSphere(ctx, vcenterURL, username, password, diskInfo.VMMoref)
+		baseDiskPaths, err := getBaseDiskPathsFromVSphere(ctx, vcenterURL, username, password, diskInfo.VMMoref, i.logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query base disk paths from vSphere: %w", err)
 		}
@@ -209,15 +202,11 @@ func (i *VirtInspector) attemptInspect(
 		diskArgs.Add(args...)
 	}
 
-	// XML goes to stdout, debug logs to stderr.
-	stdout, stderr, err := diskArgs.RunSeparate(inspectCtx, i.virtInspectorPath)
+	// XML goes to stdout, debug logs to stderr. Stream stderr in real time so
+	// progress is visible during the (potentially long) inspection run.
+	stdout, stderr, err := diskArgs.RunSeparateStream(inspectCtx, i.virtInspectorPath, os.Stderr)
 
-	// Log stderr (debug output) separately
-	if len(stderr) > 0 && i.logger != nil {
-		i.logger.WithField("stderr", string(stderr)).Debug("virt-inspector stderr output")
-	}
-
-	// Use stdout for XML parsing (stderr contains debug logs)
+	// Use stdout for XML parsing; keep stderr only for encrypted-disk detection.
 	outputStr := string(stdout)
 	stderrStr := string(stderr)
 	if err != nil {
@@ -231,8 +220,6 @@ func (i *VirtInspector) attemptInspect(
 		combinedOutput := outputStr + stderrStr
 		if encrypted, reason := isEncryptedDiskError(combinedOutput); encrypted {
 			i.logger.WithFields(logrus.Fields{
-				"stdout":          outputStr,
-				"stderr":          stderrStr,
 				"exit_code":       exitCode,
 				"nbd_urls":        nbdURLs,
 				"disk_count":      len(nbdURLs),
@@ -251,9 +238,20 @@ func (i *VirtInspector) attemptInspect(
 			}
 		}
 
+		// Detect cold-start VDDK failure from stderr (content was already streamed
+		// live to os.Stderr, so we only embed a short sentinel — not the full output).
+		if isColdStartOutput(stderrStr) {
+			i.logger.WithFields(logrus.Fields{
+				"exit_code":  exitCode,
+				"nbd_urls":   nbdURLs,
+				"disk_count": len(nbdURLs),
+				"executable": i.virtInspectorPath,
+				"args":       diskArgs.MaskedArgs(),
+			}).Error("virt-inspector failed with cold-start symptoms")
+			return nil, fmt.Errorf("virt-inspector cold-start failure (exit code %d): %w", exitCode, err)
+		}
+
 		i.logger.WithFields(logrus.Fields{
-			"stdout":     outputStr,
-			"stderr":     stderrStr,
 			"exit_code":  exitCode,
 			"nbd_urls":   nbdURLs,
 			"disk_count": len(nbdURLs),
@@ -261,9 +259,8 @@ func (i *VirtInspector) attemptInspect(
 			"args":       diskArgs.MaskedArgs(),
 		}).Error("virt-inspector failed")
 
-		// Include output in error message for better debugging
-		if outputStr != "" || stderrStr != "" {
-			return nil, fmt.Errorf("virt-inspector failed (exit code %d): %w\nStdout: %s\nStderr: %s", exitCode, err, outputStr, stderrStr)
+		if outputStr != "" {
+			return nil, fmt.Errorf("virt-inspector failed (exit code %d): %w\nStdout: %s", exitCode, err, outputStr)
 		}
 		return nil, fmt.Errorf("virt-inspector failed (exit code %d): %w", exitCode, err)
 	}
@@ -274,7 +271,6 @@ func (i *VirtInspector) attemptInspect(
 			i.logger.WithFields(logrus.Fields{
 				"error":  err,
 				"stdout": outputStr,
-				"stderr": string(stderr),
 			}).Error("Failed to parse virt-inspector XML output")
 		}
 		return nil, fmt.Errorf("failed to parse inspection output: %w", err)
@@ -370,16 +366,15 @@ func parseInspectionXML(xmlData []byte) (*types.VirtInspectorXML, error) {
 	return &xmlRoot, nil
 }
 
-// getBaseDiskPathsFromVSphere queries vSphere to get base disk paths by traversing the backing chain
-func (i *VirtInspector) getBaseDiskPathsFromVSphere(ctx context.Context, vcenterURL, username, password, vmMoref string) ([]string, error) {
-	// Import the vsphere package
-	vsphereClient, err := vsphere.NewClient(ctx, vcenterURL, username, password, true, i.logger)
+// getBaseDiskPathsFromVSphere queries vSphere to get base disk paths by traversing the backing chain.
+// It is a package-level function so both VirtInspector and VirtV2vInspector can share it.
+func getBaseDiskPathsFromVSphere(ctx context.Context, vcenterURL, username, password, vmMoref string, logger *logrus.Logger) ([]string, error) {
+	vsphereClient, err := vsphere.NewClient(ctx, vcenterURL, username, password, true, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to vSphere: %w", err)
 	}
 	defer vsphereClient.Close()
 
-	// Query base disk paths
 	baseDiskPaths, err := vsphereClient.GetBaseDiskPaths(ctx, vmMoref)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get base disk paths: %w", err)
