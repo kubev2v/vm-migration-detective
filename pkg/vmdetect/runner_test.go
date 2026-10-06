@@ -54,3 +54,19 @@ func TestLocalInspectorArgsFormatBeforeDisk(t *testing.T) {
 		}
 	}
 }
+
+func TestDetectNBDValidation(t *testing.T) {
+	detector, err := NewDetector(DetectorConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := detector.DetectNBD(DetectNBDParams{NBDURLs: []string{"nbd://10.0.0.1:10809"}}); err == nil {
+		t.Fatal("expected error when Ctx is nil")
+	}
+	if _, err := detector.DetectNBD(DetectNBDParams{Ctx: context.Background()}); err == nil {
+		t.Fatal("expected error when NBDURLs is empty")
+	}
+	if _, err := detector.DetectNBD(DetectNBDParams{Ctx: context.Background(), NBDURLs: []string{"nbds://10.0.0.1:10809"}}); err == nil {
+		t.Fatal("expected error when nbds:// lacks TLSCertificates")
+	}
+}

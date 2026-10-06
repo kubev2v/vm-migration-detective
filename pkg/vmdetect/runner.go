@@ -6,6 +6,7 @@ import (
 	"time"
 
 	internalchecks "github.com/kubev2v/vm-migration-detective/internal/checks"
+	"github.com/kubev2v/vm-migration-detective/internal/inspection"
 	"github.com/kubev2v/vm-migration-detective/internal/persistent"
 	"github.com/kubev2v/vm-migration-detective/internal/tlsconfig"
 	"github.com/kubev2v/vm-migration-detective/internal/vsphere"
@@ -413,6 +414,33 @@ func (r *Detector) DetectLocal(params DetectLocalParams) (*DetectResult, error) 
 		Filesystems:  filesystems,
 		Mountpoints:  mountpoints,
 	}, nil
+}
+
+// DetectNBDParams specifies caller-owned NBD URLs.
+type DetectNBDParams struct {
+	Ctx             context.Context
+	NBDURLs         []string
+	TLSCertificates string // required for nbds://
+}
+
+// DetectNBD inspects pre-existing NBD exports. nbds:// is proxied via nbdkit-nbd.
+func (r *Detector) DetectNBD(params DetectNBDParams) (*DetectResult, error) {
+	if params.Ctx == nil {
+		return nil, fmt.Errorf("params.Ctx is required")
+	}
+	if len(params.NBDURLs) == 0 {
+		return nil, fmt.Errorf("at least one NBD URL is required")
+	}
+	urls, closer, err := inspection.ResolveNBDURLsForInspector(params.Ctx, params.NBDURLs, params.TLSCertificates, r.logger)
+	if err != nil {
+		return nil, err
+	}
+	defer closer()
+	formats := make([]string, len(urls))
+	for i := range formats {
+		formats[i] = "raw"
+	}
+	return r.DetectLocal(DetectLocalParams{Ctx: params.Ctx, DiskPaths: urls, Formats: formats})
 }
 
 // localInspectorArgs builds virt-inspector disk args. --format must precede
