@@ -17,6 +17,10 @@ const (
 )
 
 // Concern represents a validation concern found during checks
+//
+// API Compatibility Note: The Details field was added as an optional field using omitempty,
+// making this a backwards-compatible schema change. Existing API consumers will continue to
+// work without modification.
 type Concern struct {
 	// ID is the unique identifier for this concern type
 	ID string `json:"id"`
@@ -26,6 +30,10 @@ type Concern struct {
 	Label string `json:"label"`
 	// Message provides detailed information about the concern
 	Message string `json:"message"`
+	// Details provides supplementary information beyond the main message (optional).
+	// Omitted from JSON when empty. Used for structured context like timestamped event lists,
+	// log excerpts, or configuration snippets.
+	Details string `json:"details,omitempty"`
 }
 
 // CheckType represents the type of validation check
@@ -36,6 +44,12 @@ const (
 	CheckTypeFstab CheckType = "fstab"
 	// CheckTypeDiskAccess validates that the disk is accessible (not encrypted)
 	CheckTypeDiskAccess CheckType = "disk-access"
+	// CheckTypeBSOD validates Windows VMs for Blue Screen of Death events
+	CheckTypeBSOD CheckType = "bsod"
+
+	// CheckTypeNotApplicable is returned by checks when they don't apply to the current OS/environment.
+	// The runner excludes these from results entirely.
+	CheckTypeNotApplicable CheckType = "not-applicable"
 )
 
 // AllCheckTypes returns all available check types
@@ -43,6 +57,7 @@ func AllCheckTypes() []CheckType {
 	return []CheckType{
 		CheckTypeFstab,
 		CheckTypeDiskAccess,
+		CheckTypeBSOD,
 	}
 }
 

@@ -207,6 +207,8 @@ func (r *Detector) Detect(params DetectParams, checkTypes ...checks.CheckType) (
 			check = internalchecks.NewFstabCheck()
 		case checks.CheckTypeDiskAccess:
 			check = internalchecks.NewDiskAccessCheck()
+		case checks.CheckTypeBSOD:
+			check = internalchecks.NewBSODCheck()
 		default:
 			// Unknown check type, skip
 			continue
@@ -214,6 +216,11 @@ func (r *Detector) Detect(params DetectParams, checkTypes ...checks.CheckType) (
 
 		// Run the check
 		checkResult := check.Run(inspectionParams)
+
+		// Skip checks that don't apply to this OS/environment
+		if checkResult.CheckType == checks.CheckTypeNotApplicable {
+			continue
+		}
 
 		// Convert internal CheckResult to public CheckResult
 		result = checks.CheckResult{
@@ -281,6 +288,20 @@ func (r *Detector) Detect(params DetectParams, checkTypes ...checks.CheckType) (
 		Filesystems:  filesystems,
 		Mountpoints:  mountpoints,
 	}, nil
+}
+
+// ExtractGuestFile copies a file from the guest VM disk to a host directory.
+// rootDevice is the guest partition device (e.g., "/dev/sda2") from virt-inspector.
+func (r *Detector) ExtractGuestFile(
+	ctx context.Context,
+	vmMoref string,
+	snapshotMoref string,
+	diskInfo *types.SnapshotDiskInfo,
+	guestPath string,
+	destDir string,
+	rootDevice string,
+) error {
+	return r.inspector.ExtractFileFromGuest(ctx, vmMoref, snapshotMoref, diskInfo, guestPath, destDir, rootDevice)
 }
 
 // getSnapshotDiskInfo queries vSphere for snapshot disk information
