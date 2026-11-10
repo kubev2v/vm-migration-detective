@@ -2,9 +2,11 @@ package cmdbuilder
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -183,7 +185,7 @@ var _ = Describe("CmdBuilder", func() {
 
 	Describe("RunSeparate", func() {
 		It("captures stdout and leaves stderr empty", func() {
-			stdout, stderr, err := New().Add("hello").RunSeparate(context.Background(), "echo")
+			stdout, stderr, err := New().Add("hello").RunSeparate(context.Background(), "echo", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(stdout)).To(ContainSubstring("hello"))
 			Expect(stderr).To(BeEmpty())
@@ -193,14 +195,14 @@ var _ = Describe("CmdBuilder", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
-			_, _, err := New().Add("-c", "sleep 10").RunSeparate(ctx, "sh")
+			_, _, err := New().Add("-c", "sleep 10").RunSeparate(ctx, "sh", nil)
 			Expect(err).To(MatchError(context.Canceled))
 		})
 	})
 
 	Describe("RunCombined", func() {
 		It("captures combined output", func() {
-			output, err := New().Add("-c", "echo combined").RunCombined(context.Background(), "sh")
+			output, err := New().Add("-c", "echo combined").RunCombined(context.Background(), "sh", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(output)).To(ContainSubstring("combined"))
 		})
@@ -209,14 +211,135 @@ var _ = Describe("CmdBuilder", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
-			_, err := New().Add("-c", "sleep 10").RunCombined(ctx, "sh")
+			_, err := New().Add("-c", "sleep 10").RunCombined(ctx, "sh", nil)
 			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("RunCombined streaming", func() {
+		It("does not hang when a child inherits the output pipe", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			DeferCleanup(cancel)
+
+			started := time.Now()
+			_, err := New().Add("-c", "sleep 10 &").RunCombined(ctx, "sh", nil)
+
+			Expect(err).To(HaveOccurred())
+			Expect(time.Since(started)).To(BeNumerically("<", 2*time.Second))
+		})
+
+		It("does not deadlock when a line exceeds the scanner limit", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			DeferCleanup(cancel)
+
+			_, err := New().Add("-c", "head -c 2097152 /dev/zero").RunCombined(ctx, "sh", nil)
+
+			Expect(err).To(HaveOccurred())
+			Expect(errors.Is(err, context.DeadlineExceeded)).To(BeFalse())
+		})
+
+		It("captures combined output identical to RunCombined", func() {
+			output, err := New().Add("-c", "echo one; echo two >&2; echo three").
+				RunCombined(context.Background(), "sh", nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(ContainSubstring("one"))
+			Expect(string(output)).To(ContainSubstring("two"))
+			Expect(string(output)).To(ContainSubstring("three"))
+		})
+
+		It("invokes onLine for each line as it arrives, in order", func() {
+			var lines []string
+			_, err := New().Add("-c", "echo alpha; echo beta; echo gamma").
+				RunCombined(context.Background(), "sh", func(line string) {
+					lines = append(lines, line)
+				})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(lines).To(Equal([]string{"alpha", "beta", "gamma"}))
+		})
+
+		It("works with a nil onLine callback", func() {
+			output, err := New().Add("-c", "echo quiet").
+				RunCombined(context.Background(), "sh", nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(output)).To(ContainSubstring("quiet"))
+		})
+
+		It("returns an error when context is cancelled", func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, err := New().Add("-c", "sleep 10").RunCombined(ctx, "sh", nil)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("propagates a non-zero exit code via ExitCode", func() {
+			_, err := New().RunCombined(context.Background(), "false", nil)
+			Expect(err).To(HaveOccurred())
+			Expect(ExitCode(err)).To(Equal(1))
+		})
+	})
+
+	Describe("RunSeparate streaming", func() {
+		It("captures stdout and stderr independently", func() {
+			stdout, stderr, err := New().Add("-c", "echo out; echo err >&2").
+				RunSeparate(context.Background(), "sh", nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(stdout)).To(ContainSubstring("out"))
+			Expect(string(stderr)).To(ContainSubstring("err"))
+			Expect(string(stdout)).NotTo(ContainSubstring("err"))
+			Expect(string(stderr)).NotTo(ContainSubstring("out"))
+		})
+
+		It("invokes onLine for each stderr line", func() {
+			var lines []string
+			_, _, err := New().Add("-c", "echo out; echo alpha >&2; echo beta >&2").
+				RunSeparate(context.Background(), "sh", func(line string) {
+					lines = append(lines, line)
+				})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(lines).To(ContainElement("alpha"))
+			Expect(lines).To(ContainElement("beta"))
+			Expect(lines).NotTo(ContainElement("out"))
+		})
+
+		It("treats carriage returns as line boundaries", func() {
+			var lines []string
+			_, _, err := New().Add("-c", "printf '10%%\\r20%%\\r' >&2").
+				RunSeparate(context.Background(), "sh", func(line string) {
+					lines = append(lines, line)
+				})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(lines).To(Equal([]string{"10%", "20%"}))
+		})
+
+		It("works with a nil onLine callback", func() {
+			stdout, stderr, err := New().Add("-c", "echo quiet; echo noise >&2").
+				RunSeparate(context.Background(), "sh", nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(stdout)).To(ContainSubstring("quiet"))
+			Expect(string(stderr)).To(ContainSubstring("noise"))
+		})
+
+		It("returns an error and stderr when command fails", func() {
+			_, stderr, err := New().Add("-c", "echo fail-info >&2; exit 1").
+				RunSeparate(context.Background(), "sh", nil)
+			Expect(err).To(HaveOccurred())
+			Expect(ExitCode(err)).To(Equal(1))
+			Expect(string(stderr)).To(ContainSubstring("fail-info"))
+		})
+
+		It("returns context.Canceled when context is cancelled", func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			_, _, err := New().Add("-c", "sleep 10").RunSeparate(ctx, "sh", nil)
+			Expect(err).To(MatchError(context.Canceled))
 		})
 	})
 
 	Describe("ExitCode", func() {
 		It("extracts the exit code from a failed command", func() {
-			_, err := New().RunCombined(context.Background(), "false")
+			_, err := New().RunCombined(context.Background(), "false", nil)
 			Expect(err).To(HaveOccurred())
 			Expect(ExitCode(err)).To(Equal(1))
 		})
