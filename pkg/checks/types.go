@@ -46,6 +46,8 @@ const (
 	CheckTypeDiskAccess CheckType = "disk-access"
 	// CheckTypeBSOD validates Windows VMs for Blue Screen of Death events
 	CheckTypeBSOD CheckType = "bsod"
+	// CheckTypeVirtV2VInspector validates the guest with virt-v2v-inspector
+	CheckTypeVirtV2VInspector CheckType = "virt-v2v-inspector"
 
 	// CheckTypeNotApplicable is returned by checks when they don't apply to the current OS/environment.
 	// The runner excludes these from results entirely.
@@ -58,6 +60,8 @@ func AllCheckTypes() []CheckType {
 		CheckTypeFstab,
 		CheckTypeDiskAccess,
 		CheckTypeBSOD,
+		// Keep the more expensive conversion preflight after the basic checks.
+		CheckTypeVirtV2VInspector,
 	}
 }
 

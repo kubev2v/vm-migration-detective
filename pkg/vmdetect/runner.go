@@ -252,6 +252,15 @@ func (r *Detector) detectStandard(ctx context.Context, vmMoref, snapshotMoref st
 	allPassed := true
 
 	for _, checkType := range checksToRun {
+		// virt-v2v-inspector is the expensive final preflight. Do not start it
+		// after an earlier check has already found a blocking concern.
+		if checkType == checks.CheckTypeVirtV2VInspector && !allPassed {
+			if r.logger != nil {
+				r.logger.Info("Skipping virt-v2v-inspector because an earlier check failed")
+			}
+			continue
+		}
+
 		var check internalchecks.Check
 		var result checks.CheckResult
 
@@ -262,6 +271,8 @@ func (r *Detector) detectStandard(ctx context.Context, vmMoref, snapshotMoref st
 			check = internalchecks.NewDiskAccessCheck()
 		case checks.CheckTypeBSOD:
 			check = internalchecks.NewBSODCheck()
+		case checks.CheckTypeVirtV2VInspector:
+			check = internalchecks.NewVirtV2VInspectorCheck()
 		default:
 			continue
 		}
