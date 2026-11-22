@@ -119,7 +119,7 @@ func newTestDetector(m *mockInspector, sslVerify string) *Detector {
 	}
 }
 
-func TestDetect_V2VDisabled_DoesNotCallV2V(t *testing.T) {
+func TestDetect_V2VDisabled_RunsAsDefaultCheckNotOnDemandPath(t *testing.T) {
 	m := &mockInspector{virtData: sampleVirtXML()}
 	d := newTestDetector(m, "no_verify=1")
 
@@ -128,11 +128,16 @@ func TestDetect_V2VDisabled_DoesNotCallV2V(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if m.v2vCalled {
-		t.Fatal("InspectWithVirtV2v must not be called when RunVirtV2v is false")
+	// MTV-5952: virt-v2v-inspector is now a registered default check
+	// (CheckTypeVirtV2VInspector in AllCheckTypes()), so standard detection
+	// runs it as the last check after fstab/disk-access succeed.
+	if !m.v2vCalled {
+		t.Fatal("InspectWithVirtV2v must be called by the default virt-v2v-inspector check during standard detection")
 	}
+	// V2VOSInfo is populated only by the separate on-demand RunVirtV2v path
+	// (detectV2VOnly), never by the standard per-check loop.
 	if res.V2VOSInfo != nil {
-		t.Fatal("V2VOSInfo must be nil when v2v disabled")
+		t.Fatal("V2VOSInfo must stay nil in standard detection - it is exclusive to the RunVirtV2v on-demand path")
 	}
 }
 
