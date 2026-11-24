@@ -59,6 +59,37 @@ type snapshotDiskPathResolver interface {
 	GetSnapshotDiskFilePath(ctx context.Context, snapshotMoref, baseDiskPath string) (string, error)
 }
 
+// resolveNBDKitThumbprint returns the thumbprint nbdkit's VDDK plugin should
+// use. A configured thumbprint is returned as-is. Otherwise computeFn is
+// called to retrieve one from the vCenter certificate - VDDK needs a
+// thumbprint to connect even when tlsConfig.Insecure is true, so this is
+// attempted regardless of that flag. Computation failure is fatal when not
+// in insecure mode (the caller asked for verified TLS and couldn't get it);
+// in insecure mode it is not, since the caller has already opted out of
+// certificate verification and nbdkit will simply skip TLS verification too.
+func resolveNBDKitThumbprint(
+	tlsConfig *tlsconfig.Config,
+	vcenterHost string,
+	logger *logrus.Logger,
+	computeFn func(string, *tlsconfig.Config) (string, error),
+) (string, error) {
+	if thumbprint := tlsConfig.ForNBDKit(); thumbprint != "" {
+		return thumbprint, nil
+	}
+
+	computed, err := computeFn(vcenterHost, tlsConfig)
+	if err != nil {
+		if !tlsConfig.Insecure {
+			return "", fmt.Errorf("failed to get vCenter thumbprint: %w", err)
+		}
+		if logger != nil {
+			logger.WithError(err).Warn("Failed to compute vCenter thumbprint in insecure mode, proceeding without it")
+		}
+		return "", nil
+	}
+	return computed, nil
+}
+
 func openWithNBDKit(
 	ctx context.Context,
 	vmMoref string,
@@ -83,21 +114,12 @@ func openWithNBDKit(
 		return nil, fmt.Errorf("TLS configuration is required")
 	}
 
-	// Get thumbprint from TLS config or compute it
-	var thumbprint string
-	thumbprint = tlsConfig.ForNBDKit()
-
-	// If no thumbprint in config but we have CA or insecure mode,
-	// try to retrieve it for nbdkit (which requires thumbprint)
-	if thumbprint == "" && !tlsConfig.Insecure {
-		if logger != nil {
-			logger.Debug("No thumbprint in config, computing from vCenter certificate")
-		}
-		computed, err := tlsconfig.GetVCenterThumbprint(vcenterHost, tlsConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get vCenter thumbprint: %w", err)
-		}
-		thumbprint = computed
+	// Get thumbprint from TLS config or compute it. nbdkit's VDDK plugin needs
+	// a thumbprint to connect even in insecure mode, so this is attempted
+	// regardless of tlsConfig.Insecure; only the failure handling differs.
+	thumbprint, err := resolveNBDKitThumbprint(tlsConfig, vcenterHost, logger, tlsconfig.GetVCenterThumbprint)
+	if err != nil {
+		return nil, err
 	}
 
 	if logger != nil && thumbprint != "" {
