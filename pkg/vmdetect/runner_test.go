@@ -119,7 +119,7 @@ func newTestDetector(m *mockInspector, sslVerify string) *Detector {
 	}
 }
 
-func TestDetect_V2VDisabled_DoesNotCallV2V(t *testing.T) {
+func TestDetect_V2VDisabled_RunsAsDefaultCheckNotOnDemandPath(t *testing.T) {
 	m := &mockInspector{virtData: sampleVirtXML()}
 	d := newTestDetector(m, "no_verify=1")
 
@@ -128,11 +128,16 @@ func TestDetect_V2VDisabled_DoesNotCallV2V(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if m.v2vCalled {
-		t.Fatal("InspectWithVirtV2v must not be called when RunVirtV2v is false")
+	// MTV-5952: virt-v2v-inspector is now a registered default check
+	// (CheckTypeVirtV2VInspector in AllCheckTypes()), so standard detection
+	// runs it as the last check after fstab/disk-access succeed.
+	if !m.v2vCalled {
+		t.Fatal("InspectWithVirtV2v must be called by the default virt-v2v-inspector check during standard detection")
 	}
+	// V2VOSInfo is populated only by the separate on-demand RunVirtV2v path
+	// (detectV2VOnly), never by the standard per-check loop.
 	if res.V2VOSInfo != nil {
-		t.Fatal("V2VOSInfo must be nil when v2v disabled")
+		t.Fatal("V2VOSInfo must stay nil in standard detection - it is exclusive to the RunVirtV2v on-demand path")
 	}
 }
 
@@ -184,5 +189,38 @@ func TestDetect_V2VFailure_AddsConcernAndFailsPassed(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected virt-v2v-dry-run-failed concern")
+	}
+}
+
+// virtXMLWithNonMigrateableFstab makes FstabCheck report Passed:false via a
+// real concern while InspectWithVirt itself still succeeds, so detectStandard
+// reaches its per-check loop instead of returning early.
+func virtXMLWithNonMigrateableFstab() *types.VirtInspectorXML {
+	x := &types.VirtInspectorXML{}
+	x.Operatingsystems = []types.OS{{
+		Name:   "linux",
+		Distro: "rhel",
+		Mountpoints: types.Mountpoints{
+			Mountpoint: []types.Mountpoint{
+				{Device: "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:0:0", MountPoint: "/"},
+			},
+		},
+	}}
+	return x
+}
+
+func TestDetect_SkipsVirtV2VInspectorWhenEarlierCheckFails(t *testing.T) {
+	m := &mockInspector{virtData: virtXMLWithNonMigrateableFstab()}
+	d := newTestDetector(m, "no_verify=1")
+
+	res, err := d.detectWithDiskInfo(context.Background(), "vm-1", "snap-1", &types.SnapshotDiskInfo{ComputeResourcePath: "/dc/cluster/host"}, CheckSelection{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.v2vCalled {
+		t.Fatal("expected virt-v2v-inspector to be skipped after an earlier check (fstab) already failed")
+	}
+	if res.Passed {
+		t.Fatal("expected Passed=false")
 	}
 }
